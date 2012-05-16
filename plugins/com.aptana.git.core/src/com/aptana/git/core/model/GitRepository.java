@@ -56,10 +56,13 @@ import org.eclipse.core.runtime.Status;
 import org.eclipse.core.runtime.SubMonitor;
 import org.eclipse.core.runtime.jobs.Job;
 
+import com.aptana.core.ShellExecutable;
 import com.aptana.core.logging.IdeLog;
 import com.aptana.core.util.ArrayUtil;
 import com.aptana.core.util.EclipseUtil;
 import com.aptana.core.util.IOUtil;
+import com.aptana.core.util.PathUtil;
+import com.aptana.core.util.ProcessUtil;
 import com.aptana.core.util.StringUtil;
 import com.aptana.filewatcher.FileWatcher;
 import com.aptana.git.core.GitPlugin;
@@ -72,6 +75,342 @@ import com.aptana.git.core.model.GitRef.TYPE;
  */
 public class GitRepository
 {
+	private final class RefsRemotesJNotifyAdapter implements JNotifyListener
+	{
+		public void fileRenamed(int wd, String rootPath, String oldName, String newName)
+		{
+			if (newName == null)
+			{
+				return;
+			}
+			if (isProbablyBranch(newName))
+			{
+				// FIXME Can't tell if we pushed or pulled unless we look at sha tree/commit list. For
+				// now,
+				// seems harmless to fire both.
+				Job job = new Job("Firing pull and push event") //$NON-NLS-1$
+				{
+					@Override
+					protected IStatus run(IProgressMonitor monitor)
+					{
+						firePullEvent();
+						firePushEvent();
+						return Status.OK_STATUS;
+					}
+				};
+				job.setSystem(!EclipseUtil.showSystemJobs());
+				job.schedule();
+			}
+		}
+
+		// Determine if filename is referring to a remote branch, and not the remote itself.
+		private boolean isProbablyBranch(String newName)
+		{
+			return newName != null && newName.indexOf(File.separator) != -1 && !newName.endsWith(DOT_LOCK);
+		}
+
+		public void fileModified(int wd, String rootPath, String name)
+		{
+			if (name == null)
+			{
+				return;
+			}
+			if (isProbablyBranch(name))
+			{
+				// FIXME Can't tell if we pushed or pulled unless we look at sha tree/commit list. For
+				// now,
+				// seems harmless to fire both.
+				Job job = new Job("Firing pull and push event") //$NON-NLS-1$
+				{
+					@Override
+					protected IStatus run(IProgressMonitor monitor)
+					{
+						firePullEvent();
+						firePushEvent();
+						return Status.OK_STATUS;
+					}
+				};
+				job.setSystem(!EclipseUtil.showSystemJobs());
+				job.schedule();
+			}
+		}
+
+		public void fileDeleted(int wd, String rootPath, final String name)
+		{
+			// if path is longer than one segment, then remote branch was deleted. Means we probably
+			// pulled.
+			if (isProbablyBranch(name))
+			{
+				synchronized (branches)
+				{
+					branches.remove(new GitRevSpecifier(GitRef.refFromString(GitRef.REFS_REMOTES + name)));
+				}
+				Job job = new Job("Firing branch removed and pull event") //$NON-NLS-1$
+				{
+					@Override
+					protected IStatus run(IProgressMonitor monitor)
+					{
+						fireBranchRemovedEvent(name);
+						firePullEvent();
+						return Status.OK_STATUS;
+					}
+				};
+				job.setSystem(!EclipseUtil.showSystemJobs());
+				job.schedule();
+			}
+		}
+
+		public void fileCreated(int wd, String rootPath, final String name)
+		{
+			if (isProbablyBranch(name))
+			{
+				// if path is longer than one segment, then remote branch was created.
+				addBranch(new GitRevSpecifier(GitRef.refFromString(GitRef.REFS_REMOTES + name)));
+				// Since we suddenly know about a new remote branch, we probably pulled.
+
+				Job job = new Job("Firing branch added and pull event") //$NON-NLS-1$
+				{
+					@Override
+					protected IStatus run(IProgressMonitor monitor)
+					{
+						fireBranchAddedEvent(name);
+						firePullEvent();
+						return Status.OK_STATUS;
+					}
+				};
+				job.setSystem(!EclipseUtil.showSystemJobs());
+				job.schedule();
+			}
+		}
+	}
+
+	private final class RefsHeadsJNotifyAdapter extends JNotifyAdapter
+	{
+		@Override
+		public void fileDeleted(int wd, String rootPath, final String name)
+		{
+			if (name == null || name.endsWith(DOT_LOCK))
+			{
+				return;
+			}
+			// Remove branch in model!
+			final GitRevSpecifier rev = new GitRevSpecifier(GitRef.refFromString(GitRef.REFS_HEADS + name));
+			synchronized (branches)
+			{
+				branches.remove(rev);
+			}
+
+			Job job = new Job("Handle branch removal") //$NON-NLS-1$
+			{
+				@Override
+				protected IStatus run(IProgressMonitor monitor)
+				{
+					// the branch may in fact still exists
+					reloadRefs();
+					// only fires the event if the branch is indeed removed
+					boolean contains = false;
+					synchronized (branches)
+					{
+						contains = branches.contains(rev);
+					}
+					if (!contains)
+					{
+						fireBranchRemovedEvent(name);
+					}
+					return Status.OK_STATUS;
+				}
+			};
+			job.setSystem(!EclipseUtil.showSystemJobs());
+			job.schedule();
+		}
+
+		@Override
+		public void fileCreated(int wd, String rootPath, final String name)
+		{
+			if (name == null || name.endsWith(DOT_LOCK))
+			{
+				return;
+			}
+			// a branch has been added
+			addBranch(new GitRevSpecifier(GitRef.refFromString(GitRef.REFS_HEADS + name)));
+
+			Job job = new Job("Checking if HEAD changed") //$NON-NLS-1$
+			{
+				@Override
+				protected IStatus run(IProgressMonitor monitor)
+				{
+					fireBranchAddedEvent(name);
+					// Check if our HEAD changed
+					String oldBranchName = currentBranch.simpleRef().shortName();
+					if (oldBranchName.equals(name))
+					{
+						return Status.OK_STATUS;
+					}
+					_headRef = null;
+					readCurrentBranch();
+					fireBranchChangeEvent(oldBranchName, name);
+					return Status.OK_STATUS;
+				}
+			};
+			job.setSystem(!EclipseUtil.showSystemJobs());
+			job.schedule();
+		}
+	}
+
+	private final class RefsDirJNotifyAdapater extends JNotifyAdapter
+	{
+		public void fileCreated(int wd, String rootPath, String name)
+		{
+			if (name != null && name.equals("remotes")) //$NON-NLS-1$
+			{
+				try
+				{
+					addRemotesFileWatcher();
+				}
+				catch (JNotifyException e)
+				{
+					IdeLog.logError(GitPlugin.getDefault(), e, IDebugScopes.DEBUG);
+				}
+
+				if (remoteDirCreationWatchId == -1)
+				{
+					return;
+				}
+				// Remove this watcher!
+				Job job = new Job("Removing file watcher on remotes dir creation") //$NON-NLS-1$
+				{
+					@Override
+					protected IStatus run(IProgressMonitor monitor)
+					{
+						try
+						{
+							FileWatcher.removeWatch(remoteDirCreationWatchId);
+						}
+						catch (JNotifyException e)
+						{
+							IdeLog.logError(GitPlugin.getDefault(), e, IDebugScopes.DEBUG);
+						}
+						return Status.OK_STATUS;
+					}
+				};
+				job.setSystem(!EclipseUtil.showSystemJobs());
+				job.schedule();
+			}
+		}
+	}
+
+	private final class GitDirJNotifyAdapter extends JNotifyAdapter
+	{
+		private Set<String> filesToWatch;
+
+		@Override
+		public void fileRenamed(int wd, String rootPath, String oldName, String newName)
+		{
+			if (newName == null || !filesToWatch().contains(newName))
+			{
+				return;
+			}
+			if (newName.equals(HEAD))
+			{
+				checkForBranchChange();
+			}
+			else if (newName.equals(INDEX) || newName.equals(COMMIT_EDITMSG))
+			{
+				refreshIndex();
+			}
+		}
+
+		@Override
+		public void fileCreated(int wd, String rootPath, String name)
+		{
+			if (name == null)
+			{
+				return;
+			}
+			if (name.equals(INDEX))
+			{
+				refreshIndex();
+			}
+			else if (name.equals(ORIG_HEAD)) // this is done before merges (or pulls, which are just
+												// fetch + merge)
+			{
+				firePullEvent(); // we're conflating the two events here because I don't have the ideas
+			}
+			// separated in the listeners yet.
+		}
+
+		@Override
+		public void fileDeleted(int wd, String rootPath, String name)
+		{
+			if (name != null && name.equals(INDEX))
+			{
+				refreshIndex();
+			}
+		}
+
+		private Set<String> filesToWatch()
+		{
+			if (filesToWatch == null)
+			{
+				filesToWatch = new HashSet<String>();
+				filesToWatch.add(HEAD);
+				filesToWatch.add(INDEX);
+				filesToWatch.add(COMMIT_EDITMSG);
+			}
+			return filesToWatch;
+		}
+
+		@Override
+		public void fileModified(int wd, String rootPath, String name)
+		{
+			if (name == null || !filesToWatch().contains(name))
+			{
+				return;
+			}
+			if (name.equals(HEAD))
+			{
+				checkForBranchChange();
+			}
+			else if (name.equals(INDEX) || name.equals(COMMIT_EDITMSG))
+			{
+				refreshIndex();
+			}
+		}
+
+		// Do long running work in another thread/job so we don't tie up the jnotify locks!
+		private void refreshIndex()
+		{
+			// FIXME We get this when the index file changes, which can happen on stage/unstage/rm/add.
+			// Can we temporarily disable it if the operation causing it is us and we're already up to
+			// date? Maybe if we know that the filewatcher is going to pick it up, we just don't refresh
+			// in our own code?
+			index().scheduleBatchRefresh();
+		}
+
+		protected void checkForBranchChange()
+		{
+			Job job = new Job("Checking for current branch switch") //$NON-NLS-1$
+			{
+				@Override
+				protected IStatus run(IProgressMonitor monitor)
+				{
+					String oldBranchName = currentBranch.simpleRef().shortName();
+					_headRef = null;
+					readCurrentBranch();
+					String newBranchName = currentBranch.simpleRef().shortName();
+					if (oldBranchName.equals(newBranchName))
+					{
+						return Status.OK_STATUS;
+					}
+					fireBranchChangeEvent(oldBranchName, newBranchName);
+					return Status.OK_STATUS;
+				}
+			};
+			job.setSystem(!EclipseUtil.showSystemJobs());
+			job.schedule();
+		}
+	}
+
 	/**
 	 * Order branches alphabetically, with local branches all appearing before remote ones.
 	 * 
@@ -205,7 +544,7 @@ public class GitRepository
 	private GitIndex index;
 	private boolean hasChanged;
 	private GitRevSpecifier currentBranch;
-	private Set<Integer> fileWatcherIds = new HashSet<Integer>();
+	private Set<Integer> fileWatcherIds = new HashSet<Integer>(5);
 	private int remoteDirCreationWatchId = -1;
 	private Set<IGitRepositoryListener> listeners;
 
@@ -226,120 +565,10 @@ public class GitRepository
 		{
 			// FIXME When actions are taken through our model/UI we end up causing multiple refreshes for index changes
 			// index appears to change on commit/stage/unstage/pull
+
 			// Add listener for changes in HEAD (i.e. switched branches), and index
 			fileWatcherIds.add(FileWatcher.addWatch(gitDirPath().toOSString(), IJNotify.FILE_ANY, false,
-					new JNotifyAdapter()
-					{
-
-						private Set<String> filesToWatch;
-
-						@Override
-						public void fileRenamed(int wd, String rootPath, String oldName, String newName)
-						{
-							if (newName == null || !filesToWatch().contains(newName))
-							{
-								return;
-							}
-							if (newName.equals(HEAD))
-							{
-								checkForBranchChange();
-							}
-							else if (newName.equals(INDEX) || newName.equals(COMMIT_EDITMSG))
-							{
-								refreshIndex();
-							}
-						}
-
-						@Override
-						public void fileCreated(int wd, String rootPath, String name)
-						{
-							if (name == null)
-							{
-								return;
-							}
-							if (name.equals(INDEX))
-							{
-								refreshIndex();
-							}
-							else if (name.equals(ORIG_HEAD)) // this is done before merges (or pulls, which are just
-																// fetch + merge)
-							{
-								firePullEvent(); // we're conflating the two events here because I don't have the ideas
-							}
-							// separated in the listeners yet.
-						}
-
-						@Override
-						public void fileDeleted(int wd, String rootPath, String name)
-						{
-							if (name != null && name.equals(INDEX))
-							{
-								refreshIndex();
-							}
-						}
-
-						private Set<String> filesToWatch()
-						{
-							if (filesToWatch == null)
-							{
-								filesToWatch = new HashSet<String>();
-								filesToWatch.add(HEAD);
-								filesToWatch.add(INDEX);
-								filesToWatch.add(COMMIT_EDITMSG);
-							}
-							return filesToWatch;
-						}
-
-						@Override
-						public void fileModified(int wd, String rootPath, String name)
-						{
-							if (name == null || !filesToWatch().contains(name))
-							{
-								return;
-							}
-							if (name.equals(HEAD))
-							{
-								checkForBranchChange();
-							}
-							else if (name.equals(INDEX) || name.equals(COMMIT_EDITMSG))
-							{
-								refreshIndex();
-							}
-						}
-
-						// Do long running work in another thread/job so we don't tie up the jnotify locks!
-						private void refreshIndex()
-						{
-							// FIXME We get this when the index file changes, which can happen on stage/unstage/rm/add.
-							// Can we temporarily disable it if the operation causing it is us and we're already up to
-							// date? Maybe if we know that the filewatcher is going to pick it up, we just don't refresh
-							// in our own code?
-							index().scheduleBatchRefresh();
-						}
-
-						protected void checkForBranchChange()
-						{
-							Job job = new Job("Checking for current branch switch") //$NON-NLS-1$
-							{
-								@Override
-								protected IStatus run(IProgressMonitor monitor)
-								{
-									String oldBranchName = currentBranch.simpleRef().shortName();
-									_headRef = null;
-									readCurrentBranch();
-									String newBranchName = currentBranch.simpleRef().shortName();
-									if (oldBranchName.equals(newBranchName))
-									{
-										return Status.OK_STATUS;
-									}
-									fireBranchChangeEvent(oldBranchName, newBranchName);
-									return Status.OK_STATUS;
-								}
-							};
-							job.setSystem(!EclipseUtil.showSystemJobs());
-							job.schedule();
-						}
-					}));
+					new GitDirJNotifyAdapter()));
 
 			// Add listener for remotes
 			if (gitFile(GitRef.REFS_REMOTES).isDirectory())
@@ -350,125 +579,13 @@ public class GitRepository
 			{
 				// If refs/remote doesn't exist, we need to add a listener on "refs" for creation of remotes!
 				remoteDirCreationWatchId = FileWatcher.addWatch(gitFile(GitRef.REFS).getAbsolutePath(),
-						IJNotify.FILE_CREATED, false, new JNotifyAdapter()
-						{
-							public void fileCreated(int wd, String rootPath, String name)
-							{
-								if (name != null && name.equals("remotes")) //$NON-NLS-1$
-								{
-									try
-									{
-										addRemotesFileWatcher();
-									}
-									catch (JNotifyException e)
-									{
-										IdeLog.logError(GitPlugin.getDefault(), e, IDebugScopes.DEBUG);
-									}
-
-									if (remoteDirCreationWatchId == -1)
-									{
-										return;
-									}
-									// Remove this watcher!
-									Job job = new Job("Removing file watcher on remotes dir creation") //$NON-NLS-1$
-									{
-										@Override
-										protected IStatus run(IProgressMonitor monitor)
-										{
-											try
-											{
-												FileWatcher.removeWatch(remoteDirCreationWatchId);
-											}
-											catch (JNotifyException e)
-											{
-												IdeLog.logError(GitPlugin.getDefault(), e, IDebugScopes.DEBUG);
-											}
-											return Status.OK_STATUS;
-										}
-									};
-									job.setSystem(!EclipseUtil.showSystemJobs());
-									job.schedule();
-								}
-							}
-						});
+						IJNotify.FILE_CREATED, false, new RefsDirJNotifyAdapater());
 				fileWatcherIds.add(remoteDirCreationWatchId);
 			}
 
 			// Add listener for added/removed branches
 			fileWatcherIds.add(FileWatcher.addWatch(gitFile(GitRef.REFS_HEADS).getAbsolutePath(), IJNotify.FILE_CREATED
-					| IJNotify.FILE_DELETED, false, new JNotifyAdapter()
-			{
-
-				@Override
-				public void fileDeleted(int wd, String rootPath, final String name)
-				{
-					if (name == null || name.endsWith(DOT_LOCK))
-					{
-						return;
-					}
-					// Remove branch in model!
-					final GitRevSpecifier rev = new GitRevSpecifier(GitRef.refFromString(GitRef.REFS_HEADS + name));
-					synchronized (branches)
-					{
-						branches.remove(rev);
-					}
-
-					Job job = new Job("Handle branch removal") //$NON-NLS-1$
-					{
-						@Override
-						protected IStatus run(IProgressMonitor monitor)
-						{
-							// the branch may in fact still exists
-							reloadRefs();
-							// only fires the event if the branch is indeed removed
-							boolean contains = false;
-							synchronized (branches)
-							{
-								contains = branches.contains(rev);
-							}
-							if (!contains)
-							{
-								fireBranchRemovedEvent(name);
-							}
-							return Status.OK_STATUS;
-						}
-					};
-					job.setSystem(!EclipseUtil.showSystemJobs());
-					job.schedule();
-				}
-
-				@Override
-				public void fileCreated(int wd, String rootPath, final String name)
-				{
-					if (name == null || name.endsWith(DOT_LOCK))
-					{
-						return;
-					}
-					// a branch has been added
-					addBranch(new GitRevSpecifier(GitRef.refFromString(GitRef.REFS_HEADS + name)));
-
-					Job job = new Job("Checking if HEAD changed") //$NON-NLS-1$
-					{
-						@Override
-						protected IStatus run(IProgressMonitor monitor)
-						{
-							fireBranchAddedEvent(name);
-							// Check if our HEAD changed
-							String oldBranchName = currentBranch.simpleRef().shortName();
-							if (oldBranchName.equals(name))
-							{
-								return Status.OK_STATUS;
-							}
-							_headRef = null;
-							readCurrentBranch();
-							fireBranchChangeEvent(oldBranchName, name);
-							return Status.OK_STATUS;
-						}
-					};
-					job.setSystem(!EclipseUtil.showSystemJobs());
-					job.schedule();
-				}
-			}));
+					| IJNotify.FILE_DELETED, false, new RefsHeadsJNotifyAdapter()));
 		}
 		catch (JNotifyException e)
 		{
@@ -482,115 +599,7 @@ public class GitRepository
 	private void addRemotesFileWatcher() throws JNotifyException
 	{
 		fileWatcherIds.add(FileWatcher.addWatch(gitFile(GitRef.REFS_REMOTES).getAbsolutePath(), IJNotify.FILE_ANY,
-				true, new JNotifyListener()
-				{
-
-					public void fileRenamed(int wd, String rootPath, String oldName, String newName)
-					{
-						if (newName == null)
-						{
-							return;
-						}
-						if (isProbablyBranch(newName))
-						{
-							// FIXME Can't tell if we pushed or pulled unless we look at sha tree/commit list. For
-							// now,
-							// seems harmless to fire both.
-							Job job = new Job("Firing pull and push event") //$NON-NLS-1$
-							{
-								@Override
-								protected IStatus run(IProgressMonitor monitor)
-								{
-									firePullEvent();
-									firePushEvent();
-									return Status.OK_STATUS;
-								}
-							};
-							job.setSystem(!EclipseUtil.showSystemJobs());
-							job.schedule();
-						}
-					}
-
-					// Determine if filename is referring to a remote branch, and not the remote itself.
-					private boolean isProbablyBranch(String newName)
-					{
-						return newName != null && newName.indexOf(File.separator) != -1 && !newName.endsWith(DOT_LOCK);
-					}
-
-					public void fileModified(int wd, String rootPath, String name)
-					{
-						if (name == null)
-						{
-							return;
-						}
-						if (isProbablyBranch(name))
-						{
-							// FIXME Can't tell if we pushed or pulled unless we look at sha tree/commit list. For
-							// now,
-							// seems harmless to fire both.
-							Job job = new Job("Firing pull and push event") //$NON-NLS-1$
-							{
-								@Override
-								protected IStatus run(IProgressMonitor monitor)
-								{
-									firePullEvent();
-									firePushEvent();
-									return Status.OK_STATUS;
-								}
-							};
-							job.setSystem(!EclipseUtil.showSystemJobs());
-							job.schedule();
-						}
-					}
-
-					public void fileDeleted(int wd, String rootPath, final String name)
-					{
-						// if path is longer than one segment, then remote branch was deleted. Means we probably
-						// pulled.
-						if (isProbablyBranch(name))
-						{
-							synchronized (branches)
-							{
-								branches.remove(new GitRevSpecifier(GitRef.refFromString(GitRef.REFS_REMOTES + name)));
-							}
-							Job job = new Job("Firing branch removed and pull event") //$NON-NLS-1$
-							{
-								@Override
-								protected IStatus run(IProgressMonitor monitor)
-								{
-									fireBranchRemovedEvent(name);
-									firePullEvent();
-									return Status.OK_STATUS;
-								}
-							};
-							job.setSystem(!EclipseUtil.showSystemJobs());
-							job.schedule();
-						}
-					}
-
-					public void fileCreated(int wd, String rootPath, final String name)
-					{
-						if (isProbablyBranch(name))
-						{
-							// if path is longer than one segment, then remote branch was created.
-							addBranch(new GitRevSpecifier(GitRef.refFromString(GitRef.REFS_REMOTES + name)));
-							// Since we suddenly know about a new remote branch, we probably pulled.
-
-							Job job = new Job("Firing branch added and pull event") //$NON-NLS-1$
-							{
-								@Override
-								protected IStatus run(IProgressMonitor monitor)
-								{
-									fireBranchAddedEvent(name);
-									firePullEvent();
-									return Status.OK_STATUS;
-								}
-							};
-							job.setSystem(!EclipseUtil.showSystemJobs());
-							job.schedule();
-						}
-					}
-				}));
+				true, new RefsRemotesJNotifyAdapter()));
 	}
 
 	public IPath workingDirectory()
@@ -602,7 +611,7 @@ public class GitRepository
 		IStatus result = execute(ReadWrite.READ, gitDirPath(), "rev-parse", "--is-inside-work-tree"); //$NON-NLS-1$ //$NON-NLS-2$
 		if (result != null && result.isOK() && result.getMessage().trim().equals("true")) //$NON-NLS-1$
 		{
-			return GitExecutable.instance().path(); // FIXME This doesn't seem right....
+			return getGitExecutable().path(); // FIXME This doesn't seem right....
 		}
 
 		return null;
@@ -831,8 +840,9 @@ public class GitRepository
 			return Collections.emptySet();
 		}
 		// Now filter down to projects underneath the repo!
-		List<IProject> beneathRepo = new ArrayList<IProject>();
-		for (IProject project : ResourcesPlugin.getWorkspace().getRoot().getProjects())
+		IProject[] allProjects = ResourcesPlugin.getWorkspace().getRoot().getProjects();
+		List<IProject> beneathRepo = new ArrayList<IProject>(allProjects.length);
+		for (IProject project : allProjects)
 		{
 			if (workingDir.isPrefixOf(project.getLocation()))
 			{
@@ -846,7 +856,6 @@ public class GitRepository
 		}
 
 		// Now do a batch check against all the projects underneath our repo
-		Set<IProject> projectsNotExistingOnNewBranch = new HashSet<IProject>();
 		StringBuilder input = new StringBuilder();
 		for (IProject project : beneathRepo)
 		{
@@ -861,9 +870,9 @@ public class GitRepository
 			return Collections.emptySet();
 		}
 
-		IStatus result = GitExecutable.instance().runInBackground(input.toString(), workingDir,
-				"cat-file", "--batch-check"); //$NON-NLS-1$ //$NON-NLS-2$
+		IStatus result = getGitExecutable().runInBackground(input.toString(), workingDir, "cat-file", "--batch-check"); //$NON-NLS-1$ //$NON-NLS-2$
 		exitRead();
+		Set<IProject> projectsNotExistingOnNewBranch = new HashSet<IProject>(beneathRepo.size());
 		if (result.isOK())
 		{
 			String output = result.getMessage();
@@ -880,7 +889,7 @@ public class GitRepository
 		}
 		// APSTUD-3399 We need to see if the projects that don't exist are untracked and therefore ok (we don't need to
 		// close them)
-		Set<IProject> workingCopies = new HashSet<IProject>();
+		Set<IProject> workingCopies = new HashSet<IProject>(projectsNotExistingOnNewBranch.size());
 		for (IProject project : projectsNotExistingOnNewBranch)
 		{
 			String path = relativePath(project).append(IProjectDescription.DESCRIPTION_FILE_NAME).toPortableString();
@@ -1286,7 +1295,8 @@ public class GitRepository
 
 		try
 		{
-			return IOUtil.read(new FileInputStream(gitFile(CONFIG_FILENAME))); // $codepro.audit.disable closeWhereCreated
+			return IOUtil.read(new FileInputStream(gitFile(CONFIG_FILENAME))); // $codepro.audit.disable
+																				// closeWhereCreated
 		}
 		catch (FileNotFoundException e)
 		{
@@ -1445,7 +1455,20 @@ public class GitRepository
 
 	private IStatus execute(ReadWrite readOrWrite, IPath workingDir, String... args)
 	{
-		return execute(readOrWrite, workingDir, null, args);
+		Map<String, String> env = ShellExecutable.getEnvironment(workingDir);
+		// If we're on windows, we need to fix cygwin paths!
+		if (Platform.OS_WIN32.equals(Platform.getOS()))
+		{
+			for (Map.Entry<String, String> entry : env.entrySet())
+			{
+				if (entry.getValue().indexOf('/') != -1)
+				{
+					String converted = PathUtil.convertPATH(entry.getValue());
+					entry.setValue(converted);
+				}
+			}
+		}
+		return execute(readOrWrite, workingDir, env, args);
 	}
 
 	/**
@@ -1482,7 +1505,7 @@ public class GitRepository
 
 		try
 		{
-			return GitExecutable.instance().runInBackground(workingDir, env, args);
+			return ProcessUtil.runInBackground(getGitExecutable().path().toOSString(), workingDir, env, args);
 		}
 		finally
 		{
@@ -1499,6 +1522,11 @@ public class GitRepository
 		}
 	}
 
+	protected GitExecutable getGitExecutable()
+	{
+		return GitExecutable.instance();
+	}
+
 	IStatus executeWithInput(String input, String... args)
 	{
 		// All of these processes appear to be write, so just hard-code that
@@ -1508,7 +1536,7 @@ public class GitRepository
 		}
 		try
 		{
-			return GitExecutable.instance().runInBackground(input, workingDirectory(), args);
+			return getGitExecutable().runInBackground(input, workingDirectory(), args);
 		}
 		finally
 		{
@@ -2041,7 +2069,7 @@ public class GitRepository
 
 	public Set<String> getGithubURLs()
 	{
-		Set<String> githubURLs = new HashSet<String>();
+		Set<String> githubURLs = new HashSet<String>(2);
 		// Check the remote urls for github and use that to determine URL we need!
 		for (String remoteURL : remoteURLs())
 		{
@@ -2083,6 +2111,7 @@ public class GitRepository
 			{
 				return IOUtil.read(new FileInputStream(mergeMsg)); // $codepro.audit.disable closeWhereCreated
 			}
+
 			File squashMsg = gitFile(SQUASH_MSG);
 			if (squashMsg.exists())
 			{

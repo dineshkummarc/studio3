@@ -23,6 +23,7 @@ import org.eclipse.core.runtime.SubMonitor;
 
 import com.aptana.core.logging.IdeLog;
 import com.aptana.core.util.IOUtil;
+import com.aptana.core.util.ProcessUtil;
 import com.aptana.git.core.GitPlugin;
 import com.aptana.git.core.IDebugScopes;
 
@@ -112,8 +113,8 @@ public class GitRevList
 
 		try
 		{
-			// FIXME Move this into GitRepository, so we can set up lock/monitor on it!
-			Process p = GitExecutable.instance().run(directory, arguments.toArray(new String[arguments.size()]));
+			Process p = ProcessUtil.run(GitExecutable.instance().path().toOSString(), directory,
+					arguments.toArray(new String[arguments.size()]));
 			InputStream stream = p.getInputStream();
 
 			int num = 0;

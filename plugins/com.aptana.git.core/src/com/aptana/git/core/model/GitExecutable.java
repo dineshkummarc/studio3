@@ -338,26 +338,6 @@ public class GitExecutable
 	}
 
 	/**
-	 * Launches the git process and returns the result of the operation in an IStatus. Please DO NOT USE THIS METHOD if
-	 * you can get the operation done through GitRepository (or it should live there)! Otherwise we cannot properly
-	 * maintain a lock/monitor on reads and writes to avoid git processes stomping on each other!
-	 * 
-	 * @param workingDir
-	 * @param args
-	 * @return
-	 */
-	public IStatus runInBackground(IPath workingDir, String... args)
-	{
-		return ProcessUtil.runInBackground(gitPath.toOSString(), workingDir, args);
-	}
-
-	IStatus runInBackground(IPath workingDir, Map<String, String> env, String... args)
-	{
-		// FIXME Inline into GitRepository.execute?
-		return ProcessUtil.runInBackground(gitPath.toOSString(), workingDir, env, args);
-	}
-
-	/**
 	 * Launches the git process and returns a map from the exit value to the stdout output read in.
 	 * 
 	 * @param workingDirectory
@@ -372,23 +352,9 @@ public class GitExecutable
 	}
 
 	/**
-	 * Launches the git process and returns the handle to the active process.
-	 * 
-	 * @param directory
-	 * @param arguments
-	 * @return
-	 * @throws IOException
-	 * @throws CoreException
-	 */
-	Process run(IPath directory, String... arguments) throws IOException, CoreException
-	{
-		// FIXME Inline into GitRevList.walkRevisionListWithSpecifier
-		return ProcessUtil.run(gitPath.toOSString(), directory, arguments);
-	}
-
-	/**
 	 * Sets up the environment map in a way that our special GIT_SSH/GIT_ASKPASS env variables are set so that the SSH
-	 * passphrase/HTTPS prompt stuff is hooked up. Use this for clones/pushes/pulls.
+	 * passphrase/HTTPS prompt stuff is hooked up. Use this for clones/pushes/pulls - anything that may need to hit
+	 * remotes via SSH!
 	 * 
 	 * @return
 	 */

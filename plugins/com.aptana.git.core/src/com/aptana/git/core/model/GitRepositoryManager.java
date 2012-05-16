@@ -29,6 +29,7 @@ import org.eclipse.team.core.RepositoryProvider;
 import org.eclipse.team.core.Team;
 import org.eclipse.team.core.TeamException;
 
+import com.aptana.core.util.ProcessUtil;
 import com.aptana.git.core.GitPlugin;
 import com.aptana.git.core.GitRepositoryProvider;
 
@@ -67,7 +68,9 @@ public class GitRepositoryManager implements IGitRepositoryManager
 			for (GitRepository reference : cachedRepos.values())
 			{
 				if (reference == null)
+				{
 					continue;
+				}
 				reference.dispose();
 			}
 			cachedRepos.clear();
@@ -77,7 +80,9 @@ public class GitRepositoryManager implements IGitRepositoryManager
 	public void create(IPath path)
 	{
 		if (path == null)
+		{
 			return;
+		}
 		if (path.lastSegment().equals(GIT_DIR))
 		{
 			path = path.removeLastSegments(1);
@@ -86,13 +91,15 @@ public class GitRepositoryManager implements IGitRepositoryManager
 		File file = path.toFile();
 		URI existing = gitDirForURL(file.toURI());
 		if (existing != null)
+		{
 			return;
+		}
 
 		if (!file.exists())
 		{
 			file.mkdirs();
 		}
-		IStatus result = GitExecutable.instance().runInBackground(path, "init"); //$NON-NLS-1$
+		IStatus result = runInBackground(path, "init"); //$NON-NLS-1$
 		if (result != null && result.isOK())
 		{
 			GitRepository repo = getUnattachedExisting(path.toFile().toURI());
@@ -112,11 +119,32 @@ public class GitRepositoryManager implements IGitRepositoryManager
 		}
 	}
 
+	/**
+	 * Launches the git process and returns the result of the operation in an IStatus. Please DO NOT USE THIS METHOD if
+	 * you can get the operation done through GitRepository (or it should live there)! Otherwise we cannot properly
+	 * maintain a lock/monitor on reads and writes to avoid git processes stomping on each other!
+	 * 
+	 * @param workingDir
+	 * @param args
+	 * @return
+	 */
+	protected IStatus runInBackground(IPath workingDir, String... args)
+	{
+		return ProcessUtil.runInBackground(getGitExecutable().path().toOSString(), workingDir, args);
+	}
+
+	protected GitExecutable getGitExecutable()
+	{
+		return GitExecutable.instance();
+	}
+
 	public void removeRepository(IProject p)
 	{
 		GitRepository repo = getUnattachedExisting(p.getLocationURI());
 		if (repo == null)
+		{
 			return;
+		}
 
 		boolean dispose = true;
 		synchronized (cachedRepos)
@@ -127,7 +155,9 @@ public class GitRepositoryManager implements IGitRepositoryManager
 			for (GitRepository ref : cachedRepos.values())
 			{
 				if (ref == null)
+				{
 					continue;
+				}
 				if (ref.equals(repo))
 				{
 					dispose = false;
@@ -139,7 +169,9 @@ public class GitRepositoryManager implements IGitRepositoryManager
 		// Notify listeners
 		RepositoryRemovedEvent e = new RepositoryRemovedEvent(repo, p);
 		for (IGitRepositoriesListener listener : listeners)
+		{
 			listener.repositoryRemoved(e);
+		}
 
 		if (dispose)
 		{
@@ -151,19 +183,25 @@ public class GitRepositoryManager implements IGitRepositoryManager
 	public GitRepository getAttached(IProject project)
 	{
 		if (project == null)
+		{
 			return null;
+		}
 
 		RepositoryProvider provider = RepositoryProvider.getProvider(project, GitRepositoryProvider.ID);
 		if (provider == null)
+		{
 			return null;
+		}
 
 		return getUnattachedExisting(project.getLocationURI());
 	}
 
 	public GitRepository getUnattachedExisting(URI path)
 	{
-		if (GitExecutable.instance() == null || GitExecutable.instance().path() == null || path == null)
+		if (getGitExecutable() == null || getGitExecutable().path() == null || path == null)
+		{
 			return null;
+		}
 
 		synchronized (cachedRepos)
 		{
@@ -175,13 +213,17 @@ public class GitRepositoryManager implements IGitRepositoryManager
 
 			URI gitDirURL = gitDirForURL(path);
 			if (gitDirURL == null)
+			{
 				return null;
+			}
 
 			// Check to see if any cached repo has the same git dir
 			for (GitRepository reference : cachedRepos.values())
 			{
 				if (reference == null)
+				{
 					continue;
+				}
 				if (reference.getFileURL().getPath().equals(gitDirURL.getPath()))
 				{
 					// Same git dir, so cache under our new path as well
@@ -200,11 +242,15 @@ public class GitRepositoryManager implements IGitRepositoryManager
 	public GitRepository attachExisting(IProject project, IProgressMonitor m) throws CoreException
 	{
 		if (m == null)
+		{
 			m = new NullProgressMonitor();
+		}
 		GitRepository repo = getUnattachedExisting(project.getLocationURI());
 		m.worked(40);
 		if (repo == null)
+		{
 			return null;
+		}
 
 		try
 		{
@@ -224,13 +270,17 @@ public class GitRepositoryManager implements IGitRepositoryManager
 	{
 		RepositoryAddedEvent e = new RepositoryAddedEvent(repo, project);
 		for (IGitRepositoriesListener listener : listeners)
+		{
 			listener.repositoryAdded(e);
+		}
 	}
 
 	public URI gitDirForURL(URI repositoryURL)
 	{
-		if (GitExecutable.instance() == null)
+		if (getGitExecutable() == null)
+		{
 			return null;
+		}
 
 		IPath repositoryPath = Path.fromOSString(repositoryURL.getPath());
 		if (repositoryURL.getScheme().equals("file")) //$NON-NLS-1$
@@ -238,7 +288,9 @@ public class GitRepositoryManager implements IGitRepositoryManager
 			repositoryPath = Path.fromOSString(new File(repositoryURL).getAbsolutePath());
 		}
 		if (!repositoryPath.toFile().exists())
+		{
 			return null;
+		}
 
 		// handle the most common case of .git under the url first, since the processes are slow
 		File gitDir = repositoryPath.append(GIT_DIR).toFile();
@@ -248,16 +300,24 @@ public class GitRepositoryManager implements IGitRepositoryManager
 		}
 
 		// Use rev-parse to find the .git dir for the repository being opened
-		IStatus result = GitExecutable.instance().runInBackground(repositoryPath, "rev-parse", "--git-dir"); //$NON-NLS-1$ //$NON-NLS-2$
+		IStatus result = runInBackground(repositoryPath, "rev-parse", "--git-dir"); //$NON-NLS-1$ //$NON-NLS-2$
 		if (result == null || !result.isOK())
+		{
 			return null;
+		}
 		String newPath = result.getMessage();
 		if (newPath == null)
+		{
 			return null;
+		}
 		if (newPath.equals(GIT_DIR))
+		{
 			return repositoryPath.append(GIT_DIR).toFile().toURI();
+		}
 		if (newPath.length() > 0)
+		{
 			return new File(newPath).toURI();
+		}
 
 		return null;
 	}
@@ -265,13 +325,17 @@ public class GitRepositoryManager implements IGitRepositoryManager
 	public void addListenerToEachRepository(IGitRepositoryListener listener)
 	{
 		if (listener == null)
+		{
 			return;
+		}
 		// Go through every project in workspace and see if there's an attached repo for each, if so add listener!
 		for (IProject project : ResourcesPlugin.getWorkspace().getRoot().getProjects())
 		{
 			GitRepository repo = getAttached(project);
 			if (repo == null)
+			{
 				continue;
+			}
 			repo.addListener(listener);
 		}
 	}
@@ -279,13 +343,17 @@ public class GitRepositoryManager implements IGitRepositoryManager
 	public void removeListenerFromEachRepository(IGitRepositoryListener listener)
 	{
 		if (listener == null)
+		{
 			return;
+		}
 		// Go through every project in workspace and see if there's an attached repo for each, if so add listener!
 		for (IProject project : ResourcesPlugin.getWorkspace().getRoot().getProjects())
 		{
 			GitRepository repo = getAttached(project);
 			if (repo == null)
+			{
 				continue;
+			}
 			repo.removeListener(listener);
 		}
 	}
@@ -295,7 +363,7 @@ public class GitRepositoryManager implements IGitRepositoryManager
 		SubMonitor sub = SubMonitor.convert(monitor, 100);
 		try
 		{
-			if (GitExecutable.instance() == null)
+			if (getGitExecutable() == null)
 			{
 				throw new CoreException(new Status(IStatus.ERROR, GitPlugin.getPluginId(),
 						Messages.GitRepositoryManager_UnableToFindGitExecutableError));
@@ -305,12 +373,16 @@ public class GitRepositoryManager implements IGitRepositoryManager
 			if (repo == null)
 			{
 				if (sub.isCanceled())
+				{
 					throw new CoreException(Status.CANCEL_STATUS);
+				}
 				create(project.getLocation());
 			}
 			sub.worked(50);
 			if (sub.isCanceled())
+			{
 				throw new CoreException(Status.CANCEL_STATUS);
+			}
 			return attachExisting(project, sub.newChild(50));
 		}
 		finally

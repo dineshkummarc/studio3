@@ -271,8 +271,7 @@ public class EditBundleJob extends Job
 						Messages.EditBundleJob_RequiresGitError));
 			}
 			// definitely looks like a git repo
-			result = GitExecutable.instance().runInBackground(workingDirectory, "clone", repoURI, //$NON-NLS-1$
-					destRuble.toOSString());
+			result = GitExecutable.instance().clone(repoURI, destRuble, false, null);
 		}
 		else if (looksLikeSVNURI(repoURI))
 		{
@@ -289,8 +288,7 @@ public class EditBundleJob extends Job
 						Messages.EditBundleJob_RequiresGitError));
 			}
 			// we couldn't determine git or SVN, so let's just assume git.
-			result = GitExecutable.instance().runInBackground(workingDirectory, "clone", repoURI, //$NON-NLS-1$
-					destRuble.toOSString());
+			result = GitExecutable.instance().clone(repoURI, destRuble, false, null);
 		}
 		// Non-zero exit code, so we probably had an error...
 		if (!result.isOK())
