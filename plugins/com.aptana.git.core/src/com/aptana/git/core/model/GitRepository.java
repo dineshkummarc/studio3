@@ -59,6 +59,7 @@ import org.eclipse.core.runtime.jobs.Job;
 import com.aptana.core.ShellExecutable;
 import com.aptana.core.logging.IdeLog;
 import com.aptana.core.util.ArrayUtil;
+import com.aptana.core.util.CollectionsUtil;
 import com.aptana.core.util.EclipseUtil;
 import com.aptana.core.util.IOUtil;
 import com.aptana.core.util.PathUtil;
@@ -79,28 +80,7 @@ public class GitRepository
 	{
 		public void fileRenamed(int wd, String rootPath, String oldName, String newName)
 		{
-			if (newName == null)
-			{
-				return;
-			}
-			if (isProbablyBranch(newName))
-			{
-				// FIXME Can't tell if we pushed or pulled unless we look at sha tree/commit list. For
-				// now,
-				// seems harmless to fire both.
-				Job job = new Job("Firing pull and push event") //$NON-NLS-1$
-				{
-					@Override
-					protected IStatus run(IProgressMonitor monitor)
-					{
-						firePullEvent();
-						firePushEvent();
-						return Status.OK_STATUS;
-					}
-				};
-				job.setSystem(!EclipseUtil.showSystemJobs());
-				job.schedule();
-			}
+			fileModified(wd, rootPath, newName);
 		}
 
 		// Determine if filename is referring to a remote branch, and not the remote itself.
@@ -118,8 +98,7 @@ public class GitRepository
 			if (isProbablyBranch(name))
 			{
 				// FIXME Can't tell if we pushed or pulled unless we look at sha tree/commit list. For
-				// now,
-				// seems harmless to fire both.
+				// now, seems harmless to fire both.
 				Job job = new Job("Firing pull and push event") //$NON-NLS-1$
 				{
 					@Override
@@ -331,12 +310,14 @@ public class GitRepository
 			{
 				refreshIndex();
 			}
-			else if (name.equals(ORIG_HEAD)) // this is done before merges (or pulls, which are just
-												// fetch + merge)
+			// this is done before merges (or pulls, which are just fetch + merge)
+			else if (name.equals(ORIG_HEAD))
 			{
-				firePullEvent(); // we're conflating the two events here because I don't have the ideas
+				firePullEvent();
+				// we're conflating the two events here because I don't have the ideas
+				// separated in the listeners yet.
 			}
-			// separated in the listeners yet.
+
 		}
 
 		@Override
@@ -352,10 +333,7 @@ public class GitRepository
 		{
 			if (filesToWatch == null)
 			{
-				filesToWatch = new HashSet<String>();
-				filesToWatch.add(HEAD);
-				filesToWatch.add(INDEX);
-				filesToWatch.add(COMMIT_EDITMSG);
+				filesToWatch = CollectionsUtil.newSet(HEAD, INDEX, COMMIT_EDITMSG);
 			}
 			return filesToWatch;
 		}
